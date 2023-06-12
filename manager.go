@@ -1,14 +1,17 @@
 package out
 
 import (
+	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	"atomicgo.dev/cursor"
 	atomics "github.com/tiagoposse/go-sync-types"
 
-	"atomicgo.dev/cursor"
 	"github.com/fatih/color"
 
 	"golang.org/x/crypto/ssh/terminal"
@@ -21,7 +24,7 @@ var termHeight int
 
 type OutputManager struct {
 	out                 io.Writer
-	outstandingLog      *atomics.Slice[string]
+	outstandingLog      *atomics.Slice[byte]
 	tasks               *atomics.OrderedMap[string, TaskLogger]
 	refreshInterval     time.Duration
 	currentLineCount    int
@@ -32,7 +35,6 @@ type OutputManager struct {
 	time                string
 	tty                 bool
 	spinner             int
-	maxOutputPerTask    int
 	running             sync.WaitGroup
 	closeOut            chan struct{}
 	colorSchemes        map[VerbosityLevel]func(format string, a ...interface{}) string
@@ -43,16 +45,15 @@ type OutputManagerOption func(tl *OutputManager)
 func NewOutputManager(opts ...OutputManagerOption) (*OutputManager, error) {
 	now := time.Now()
 	mgr := &OutputManager{
-		tasks:            atomics.NewOrderedMap[string, TaskLogger](),
-		time:             now.Format("2006_01_02_15_04_05"),
-		tty:              true,
-		refreshInterval:  100,
-		closeOut:         make(chan struct{}),
-		maxOutputPerTask: 20,
-		logsRoot:         "",
-		out:              os.Stdout,
-		outstandingLog:   atomics.NewSlice[string](),
-		verbosity:        Info,
+		tasks:           atomics.NewOrderedMap[string, TaskLogger](),
+		time:            now.Format("2006_01_02_15_04_05"),
+		tty:             true,
+		refreshInterval: 100,
+		closeOut:        make(chan struct{}),
+		logsRoot:        "",
+		out:             os.Stdout,
+		outstandingLog:  atomics.NewSlice[byte](),
+		verbosity:       Info,
 		colorSchemes: map[VerbosityLevel]func(format string, a ...interface{}) string{
 			Error:   color.New(color.FgRed).SprintfFunc(),
 			Trace:   color.New(color.FgCyan).SprintfFunc(),
@@ -67,10 +68,11 @@ func NewOutputManager(opts ...OutputManagerOption) (*OutputManager, error) {
 		opt(mgr)
 	}
 
-	// err := os.MkdirAll(mgr.executionLogsRoot, os.ModePerm)
-	// if err != nil {
-	// 	return nil, fmt.Errorf("failed creating log root for output: %w", err)
-	// }
+	if mgr.logsRoot != "" {
+		if err := os.MkdirAll(mgr.logsRoot, os.ModePerm); err != nil {
+			return nil, fmt.Errorf("failed creating log root for output: %w", err)
+		}
+	}
 
 	termWidth, termHeight, _ = terminal.GetSize(0)
 
@@ -82,11 +84,6 @@ func (om *OutputManager) Verbosity() VerbosityLevel {
 }
 
 func (com *OutputManager) AddTask(id string, logger TaskLogger) error {
-	// var err error
-	// if err = os.MkdirAll(filepath.Join(com.executionLogsRoot, strings.ReplaceAll(id, ":", string(os.PathSeparator))), os.ModePerm); err != nil {
-	// 	return err
-	// }
-
 	com.tasks.Put(id, logger)
 
 	return nil
@@ -95,12 +92,19 @@ func (com *OutputManager) AddTask(id string, logger TaskLogger) error {
 func (com *OutputManager) CreateTask(id, title string, opts ...TaskLoggerImplOption) (*TaskLoggerImpl, error) {
 	baseOpts := []TaskLoggerImplOption{
 		WithFormat(func(msg string, verb VerbosityLevel) string {
-			return com.colorSchemes[verb](msg)
+			return com.colorSchemes[verb](id + ": " + msg)
 		}),
 		WithTaskVerbosityLevel(com.verbosity),
 	}
 
-	task := NewTaskLogger(title, append(baseOpts, opts...)...)
+	if com.logsRoot != "" {
+		baseOpts = append(baseOpts, WithLogFile(filepath.Join(com.logsRoot, strings.ReplaceAll(id, "/", "_"), com.time+".log")))
+	}
+
+	task, err := NewTaskLogger(title, append(baseOpts, opts...)...)
+	if err != nil {
+		return nil, err
+	}
 	return task, com.AddTask(id, task)
 }
 
@@ -126,7 +130,7 @@ func (com *OutputManager) RemoveTask(id string) {
 			char = fn("✔")
 		}
 
-		com.outstandingLog.Append(char + " " + task.GetTitle() + "\n")
+		com.outstandingLog.Append([]byte(char + " " + task.GetTitle() + "\n")...)
 	}
 
 	com.tasks.Remove(id)
@@ -162,16 +166,6 @@ func (com *OutputManager) _render(last bool) {
 		return
 	}
 	currentLineCount := 0
-	var maxOutPerTask int
-	if termHeight > 0 {
-		maxOutPerTask = (termHeight - 1) / com.tasks.Length()
-	} else {
-		maxOutPerTask = 1
-	}
-	if maxOutPerTask > com.maxOutputPerTask {
-		maxOutPerTask = com.maxOutputPerTask
-	}
-
 	fullTaskText := []byte{}
 	com.tasks.Iterate(func(id string, task TaskLogger) {
 		if com.tty && !task.IsHidden() {
@@ -188,32 +182,24 @@ func (com *OutputManager) _render(last bool) {
 
 			fullTaskText = append(fullTaskText, []byte(char+" "+task.GetTitle()+"\n")...)
 			currentLineCount++
-			if !last || (last && (task.IsErr() || com.keepOutput)) {
-				taskText, numLines := task.GetLastNLines(maxOutPerTask-1, termWidth-2)
-				// taskText = append(taskText, []byte(fmt.Sprintf("Num lines: %d: %v\n", numLines, taskText))...)
-				// currentLineCount++
-				currentLineCount += numLines
-				fullTaskText = append(fullTaskText, taskText...)
-			}
-		} else {
-			taskText := task.GetTextAndClear()
-			if taskText == "" {
-				return
-			}
-
-			com.outstandingLog.Append(taskText)
 		}
+
+		com.outstandingLog.Append(task.GetExecutionLog()...)
 	})
 
 	if com.currentLineCount > 0 && com.tty {
 		cursor.ClearLinesUp(com.currentLineCount)
 	}
 
-	for _, line := range com.outstandingLog.GetAndClear() {
-		com.out.Write([]byte(line))
-	}
-
+	com.out.Write(com.outstandingLog.GetAndClear())
 	com.out.Write(fullTaskText)
+
+	if com.currentLineCount > currentLineCount {
+		for i := 0; i < (com.currentLineCount - currentLineCount); i++ {
+			fmt.Println("")
+		}
+		cursor.ClearLinesUp(com.currentLineCount - currentLineCount)
+	}
 
 	com.spinner++
 	if com.spinner == 6 {

@@ -2,6 +2,9 @@ package out
 
 import (
 	"fmt"
+	"io/ioutil"
+	"os"
+	"path/filepath"
 
 	atomics "github.com/tiagoposse/go-sync-types"
 )
@@ -9,31 +12,45 @@ import (
 type TaskLoggerImplOption func(tl *TaskLoggerImpl)
 
 type TaskLoggerImpl struct {
-	title     *atomics.Value[string]
-	format    func(msg string, verb VerbosityLevel) string
-	text      *TaskOutput
-	err       *atomics.Value[bool]
-	complete  *atomics.Value[bool]
-	hidden    *atomics.Value[bool]
-	verbosity VerbosityLevel
+	title       *atomics.Value[string]
+	format      func(msg string, verb VerbosityLevel) string
+	err         *atomics.Value[bool]
+	complete    *atomics.Value[bool]
+	hidden      *atomics.Value[bool]
+	execLog     *atomics.Slice[byte]
+	verbosity   VerbosityLevel
+	logFilePath string
+	*os.File
 }
 
-func NewTaskLogger(title string, opts ...TaskLoggerImplOption) *TaskLoggerImpl {
+func NewTaskLogger(title string, opts ...TaskLoggerImplOption) (*TaskLoggerImpl, error) {
 	tl := &TaskLoggerImpl{
-		title:     &atomics.Value[string]{},
-		text:      NewTaskOutput(),
-		format:    func(msg string, verb VerbosityLevel) string { return msg },
-		err:       &atomics.Value[bool]{},
-		complete:  &atomics.Value[bool]{},
-		hidden:    &atomics.Value[bool]{},
-		verbosity: Info,
+		title:       &atomics.Value[string]{},
+		format:      func(msg string, verb VerbosityLevel) string { return msg },
+		err:         &atomics.Value[bool]{},
+		complete:    &atomics.Value[bool]{},
+		hidden:      &atomics.Value[bool]{},
+		verbosity:   Info,
+		logFilePath: "",
+		execLog:     atomics.NewSlice[byte](),
 	}
 
 	for _, o := range opts {
 		o(tl)
 	}
 
-	return tl
+	if tl.logFilePath != "" {
+		if err := os.MkdirAll(filepath.Dir(tl.logFilePath), os.ModePerm); err != nil {
+			return nil, err
+		}
+		if f, err := os.Create(tl.logFilePath); err != nil {
+			return nil, err
+		} else {
+			tl.File = f
+		}
+	}
+
+	return tl, nil
 }
 
 func (tl *TaskLoggerImpl) write(msg string, verb VerbosityLevel) {
@@ -41,8 +58,7 @@ func (tl *TaskLoggerImpl) write(msg string, verb VerbosityLevel) {
 		return
 	}
 
-	msg = tl.format(msg, verb)
-	tl.text.Append(msg)
+	tl.execLog.Append([]byte(tl.format(msg, verb))...)
 }
 
 func (tl *TaskLoggerImpl) Warn(msg string) {
@@ -110,14 +126,6 @@ func (tl *TaskLoggerImpl) SetStatus(status string, args ...any) {
 	tl.title.Set(fmt.Sprintf(status, args...))
 }
 
-func (tl *TaskLoggerImpl) GetText() string {
-	return tl.text.Get()
-}
-
-func (tl *TaskLoggerImpl) GetTextAndClear() string {
-	return tl.text.GetAndClear()
-}
-
 func (tl *TaskLoggerImpl) GetTitle() string {
 	return tl.title.Get()
 }
@@ -134,7 +142,18 @@ func (tl *TaskLoggerImpl) IsHidden() bool {
 	return tl.hidden.Get()
 }
 
+func (tl *TaskLoggerImpl) GetLog() ([]byte, error) {
+	return ioutil.ReadFile(tl.logFilePath)
+}
+
+func (tl *TaskLoggerImpl) GetExecutionLog() []byte {
+	return tl.execLog.GetAndClear()
+}
+
 func (tl *TaskLoggerImpl) Done() {
+	if tl.logFilePath != "" {
+		tl.File.Close()
+	}
 	tl.complete.Set(true)
 }
 
@@ -156,24 +175,8 @@ func WithTaskVerbosityLevel(verb VerbosityLevel) TaskLoggerImplOption {
 	}
 }
 
-func (tl *TaskLoggerImpl) Write(b []byte) (int, error) {
-	tl.text.Append(string(b))
-	return len(b), nil
-}
-
-func (tl *TaskLoggerImpl) GetLastNLines(numLines, charLimit int) ([]byte, int) {
-	return tl.text.GetLastNLines(numLines, charLimit)
-}
-
-type Overwriter struct {
-	tl *TaskLoggerImpl
-}
-
-func (o Overwriter) Write(b []byte) (int, error) {
-	o.tl.text.Set(string(b))
-	return len(b), nil
-}
-
-func (tl *TaskLoggerImpl) GetOverwriter() Overwriter {
-	return Overwriter{tl: tl}
+func WithLogFile(path string) TaskLoggerImplOption {
+	return func(tl *TaskLoggerImpl) {
+		tl.logFilePath = path
+	}
 }

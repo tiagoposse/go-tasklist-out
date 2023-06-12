@@ -34,12 +34,6 @@ func WithKeepOutput() OutputManagerOption {
 	}
 }
 
-func WithMaxOutputPerTask(max int) OutputManagerOption {
-	return func(com *OutputManager) {
-		com.maxOutputPerTask = max
-	}
-}
-
 func WithVerbosity(verb VerbosityLevel) OutputManagerOption {
 	return func(com *OutputManager) {
 		com.verbosity = verb
